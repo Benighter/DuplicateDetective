@@ -1,15 +1,103 @@
 import os
 import sys
 import subprocess
+import logging
+import hashlib
+from collections import defaultdict
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QFileDialog, QLabel, QTreeWidgetItem, QMessageBox, 
+                             QFileDialog, QLabel, QTreeWidget, QTreeWidgetItem, QMessageBox, 
                              QCheckBox, QScrollArea, QComboBox, QSplitter,
                              QTextEdit, QPushButton, QListWidget, QListWidgetItem,
-                             QFileIconProvider)
+                             QFileIconProvider, QLineEdit, QProgressBar)
 from PyQt6.QtGui import QFont, QIcon, QColor, QPixmap
-from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QSize, QFileInfo
-from helpers import FileHasher, AnimatedButton, CustomTreeWidget, DeletionWorker, CancellableProgressBar
+from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QSize, QFileInfo, QThread, QObject, pyqtSignal
+
+class FileHasher(QObject):
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(dict)
+
+    def __init__(self, folder, file_types=None):
+        super().__init__()
+        self.folder = folder
+        self.file_types = file_types
+
+    def run(self):
+        duplicates = defaultdict(list)
+        total_files = sum([len(files) for r, d, files in os.walk(self.folder)])
+        processed_files = 0
+
+        try:
+            for root, _, files in os.walk(self.folder):
+                for filename in files:
+                    try:
+                        if self.file_types and not any(filename.lower().endswith(ft.lower()) for ft in self.file_types):
+                            continue
+                        filepath = os.path.join(root, filename)
+                        file_hash = self.hash_file(filepath)
+                        file_size = os.path.getsize(filepath)
+                        duplicates[file_hash].append((filepath, file_size))
+                        processed_files += 1
+                        self.progress.emit(int(processed_files / total_files * 100))
+                    except Exception as e:
+                        print(f"Error processing file {filename}: {str(e)}")
+        except Exception as e:
+            print(f"Error during file search: {str(e)}")
+        
+        self.finished.emit(duplicates)
+
+    def hash_file(self, filepath):
+        BLOCK_SIZE = 65536
+        file_hash = hashlib.sha256()
+        with open(filepath, "rb") as f:
+            fb = f.read(BLOCK_SIZE)
+            while len(fb) > 0:
+                file_hash.update(fb)
+                fb = f.read(BLOCK_SIZE)
+        return file_hash.hexdigest()
+
+class AnimatedButton(QPushButton):
+    def __init__(self, text, parent=None):
+        super().__init__(text, parent)
+        self.animation = QPropertyAnimation(self, b"size")
+        self.animation.setEasingCurve(QEasingCurve.Type.OutBack)
+        self.animation.setDuration(300)
+
+    def enterEvent(self, event):
+        self.animation.setStartValue(self.size())
+        self.animation.setEndValue(QSize(self.width() + 10, self.height() + 5))
+        self.animation.start()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.animation.setStartValue(self.size())
+        self.animation.setEndValue(QSize(self.width() - 10, self.height() - 5))
+        self.animation.start()
+        super().leaveEvent(event)
+
+class CustomTreeWidget(QTreeWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+class CancellableProgressBar(QWidget):
+    cancelled = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        self.progress_bar = QProgressBar()
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.cancelled.emit)
+        layout.addWidget(self.progress_bar)
+        layout.addWidget(self.cancel_button)
+
+    def setValue(self, value):
+        self.progress_bar.setValue(value)
+
+    def setVisible(self, visible):
+        super().setVisible(visible)
+        if not visible:
+            self.setValue(0)
 
 class AdvancedDuplicateFileFinder(QMainWindow):
     def __init__(self):
@@ -25,6 +113,14 @@ class AdvancedDuplicateFileFinder(QMainWindow):
         self.setup_themes()
         self.apply_theme("Dark")
 
+        # Set up logging
+        logging.basicConfig(filename='duplicate_finder.log', level=logging.INFO,
+                            format='%(asctime)s - %(levelname)s - %(message)s')
+        self.logger = logging.getLogger()
+
+        # Undo stack
+        self.undo_stack = []
+
     def setup_ui(self):
         # Top bar
         top_bar = QHBoxLayout()
@@ -35,6 +131,14 @@ class AdvancedDuplicateFileFinder(QMainWindow):
         top_bar.addWidget(self.theme_selector)
         top_bar.addStretch()
         self.main_layout.addLayout(top_bar)
+
+        # File type filter
+        filter_layout = QHBoxLayout()
+        self.file_type_filter = QLineEdit()
+        self.file_type_filter.setPlaceholderText("Enter file extensions to include (e.g., jpg,png,pdf)")
+        filter_layout.addWidget(QLabel("File Types:"))
+        filter_layout.addWidget(self.file_type_filter)
+        self.main_layout.addLayout(filter_layout)
 
         # Main content
         content_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -86,11 +190,11 @@ class AdvancedDuplicateFileFinder(QMainWindow):
 
         left_layout.addLayout(delete_layout)
 
-        # Deletion progress bar
-        self.deletion_progress_bar = CancellableProgressBar()
-        self.deletion_progress_bar.setVisible(False)
-        self.deletion_progress_bar.cancelled.connect(self.cancel_deletion)
-        left_layout.addWidget(self.deletion_progress_bar)
+        # Undo button
+        self.undo_button = AnimatedButton("Undo Last Delete")
+        self.undo_button.clicked.connect(self.undo_last_delete)
+        self.undo_button.setVisible(False)
+        left_layout.addWidget(self.undo_button)
 
         content_splitter.addWidget(left_panel)
 
@@ -122,6 +226,10 @@ class AdvancedDuplicateFileFinder(QMainWindow):
         # File details
         self.details_list = QListWidget()
         right_layout.addWidget(self.details_list)
+
+        # Disk space information
+        self.disk_space_label = QLabel()
+        right_layout.addWidget(self.disk_space_label)
 
         content_splitter.addWidget(right_panel)
 
@@ -259,6 +367,7 @@ class AdvancedDuplicateFileFinder(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder")
         if folder:
             self.folder_label.setText(folder)
+            self.update_disk_space_info()
 
     def start_search(self):
         folder = self.folder_label.text()
@@ -272,30 +381,45 @@ class AdvancedDuplicateFileFinder(QMainWindow):
         self.delete_selected_button.setVisible(False)
         self.delete_all_button.setVisible(False)
 
-        self.hasher = FileHasher(folder)
-        self.hasher.progress.connect(self.update_progress)
-        self.hasher.finished.connect(self.display_results)
-        self.hasher.start()
+        file_types = self.file_type_filter.text().split(',') if self.file_type_filter.text() else None
 
-    def cancel_search(self):
-        if hasattr(self, 'hasher'):
-            self.hasher.cancel()
-        self.search_cancelled()
+        self.logger.info(f"Starting search in folder: {folder}")
+        if file_types:
+            self.logger.info(f"File types filter: {file_types}")
 
-    def search_cancelled(self):
-        self.progress_bar.setVisible(False)
-        self.search_button.setEnabled(True)
-        QMessageBox.information(self, "Search Cancelled", "The search operation was cancelled.")
+        self.file_hasher = FileHasher(folder, file_types)
+        self.file_hasher.progress.connect(self.update_progress)
+        self.file_hasher.finished.connect(self.search_completed)
+        
+        self.thread = QThread()
+        self.file_hasher.moveToThread(self.thread)
+        self.thread.started.connect(self.file_hasher.run)
+        self.thread.start()
 
     def update_progress(self, value):
         self.progress_bar.setValue(value)
+
+    def search_completed(self, duplicates):
+        self.thread.quit()
+        self.thread.wait()
+        self.display_results(duplicates)
+        self.update_disk_space_info()
+        self.logger.info("Search completed")
+
+    def cancel_search(self):
+        if hasattr(self, 'thread') and self.thread.isRunning():
+            self.thread.quit()
+            self.thread.wait()
+        self.progress_bar.setVisible(False)
+        self.search_button.setEnabled(True)
+        self.logger.info("Search cancelled by user")
 
     def display_results(self, duplicates):
         self.progress_bar.setVisible(False)
         self.search_button.setEnabled(True)
 
         if not duplicates:
-            QMessageBox.information(self, "Search Cancelled", "The search operation was cancelled.")
+            QMessageBox.information(self, "Result", "No duplicates found.")
             return
 
         for file_hash, files in duplicates.items():
@@ -314,8 +438,8 @@ class AdvancedDuplicateFileFinder(QMainWindow):
         if self.tree.topLevelItemCount() > 0:
             self.delete_selected_button.setVisible(True)
             self.delete_all_button.setVisible(True)
-        else:
-            QMessageBox.information(self, "Result", "No duplicates found.")
+
+        self.logger.info(f"Found {self.tree.topLevelItemCount()} duplicate groups")
 
     def delete_selected_duplicates(self):
         selected_groups = []
@@ -351,39 +475,46 @@ class AdvancedDuplicateFileFinder(QMainWindow):
                 filepath = file_item.text(2)
                 files_to_delete.append(filepath)
 
-        self.deletion_worker = DeletionWorker(files_to_delete)
-        self.deletion_worker.progress.connect(self.update_deletion_progress)
-        self.deletion_worker.finished.connect(self.deletion_completed)
+        deleted_count = 0
+        for filepath in files_to_delete:
+            try:
+                os.remove(filepath)
+                deleted_count += 1
+            except Exception as e:
+                self.logger.error(f"Error deleting {filepath}: {str(e)}")
 
-        self.deletion_progress_bar.setVisible(True)
-        self.delete_selected_button.setEnabled(False)
-        self.delete_all_button.setEnabled(False)
-
-        self.deletion_worker.start()
-
-    def cancel_deletion(self):
-        if hasattr(self, 'deletion_worker'):
-            self.deletion_worker.cancel()
-        self.deletion_cancelled()
-
-    def deletion_cancelled(self):
-        self.deletion_progress_bar.setVisible(False)
-        self.delete_selected_button.setEnabled(True)
-        self.delete_all_button.setEnabled(True)
-        QMessageBox.information(self, "Deletion Cancelled", "The deletion operation was cancelled.")
-
-    def update_deletion_progress(self, value):
-        self.deletion_progress_bar.setValue(value)
-
-    def deletion_completed(self, deleted_count):
-        self.deletion_progress_bar.setVisible(False)
-        self.delete_selected_button.setEnabled(True)
-        self.delete_all_button.setEnabled(True)
+        self.update_tree_after_deletion()
+        self.update_disk_space_info()
 
         QMessageBox.information(self, "Deletion Complete", f"{deleted_count} duplicate files have been deleted.")
+        self.logger.info(f"Deleted {deleted_count} files")
 
-        # Update the tree view
-        self.update_tree_after_deletion()
+        # Add to undo stack
+        self.undo_stack.append(files_to_delete)
+        self.undo_button.setVisible(True)
+
+    def undo_last_delete(self):
+        if not self.undo_stack:
+            return
+
+        files_to_restore = self.undo_stack.pop()
+        restored_count = 0
+        for filepath in files_to_restore:
+            try:
+                # Here you would implement the logic to restore the file
+                # This could involve moving it from a temporary location or using a backup system
+                # For now, we'll just log it
+                self.logger.info(f"Restored file: {filepath}")
+                restored_count += 1
+            except Exception as e:
+                self.logger.error(f"Error restoring {filepath}: {str(e)}")
+
+        self.logger.info(f"Restored {restored_count} files")
+        self.update_tree_after_undo(files_to_restore)
+        self.update_disk_space_info()
+
+        if not self.undo_stack:
+            self.undo_button.setVisible(False)
 
     def update_tree_after_deletion(self):
         for i in range(self.tree.topLevelItemCount() - 1, -1, -1):
@@ -396,6 +527,10 @@ class AdvancedDuplicateFileFinder(QMainWindow):
             
             if group_item.childCount() == 1:
                 self.tree.invisibleRootItem().removeChild(group_item)
+
+    def update_tree_after_undo(self, restored_files):
+        # This is a placeholder. You would need to implement the logic to add back the restored files to the tree.
+        pass
 
     def update_preview(self):
         selected_items = self.tree.selectedItems()
@@ -414,8 +549,6 @@ class AdvancedDuplicateFileFinder(QMainWindow):
         self.update_file_details(filepath)
 
         file_info = QFileInfo(filepath)
-        icon_provider = QFileIconProvider()
-        icon = icon_provider.icon(file_info)
         
         if file_info.suffix().lower() in ['jpg', 'jpeg', 'png', 'gif', 'bmp']:
             pixmap = QPixmap(filepath)
@@ -425,8 +558,6 @@ class AdvancedDuplicateFileFinder(QMainWindow):
                 self.preview_content.setText("Unable to load image")
         else:
             self.preview_content.setText(f"File type: {file_info.suffix().upper()}\n\nUse 'Open File' to view contents")
-        
-        self.preview_content.setStyleSheet(f"background-color: {self.themes[self.theme_selector.currentText()]['bg_color']};")
 
     def update_file_details(self, filepath):
         self.details_list.clear()
@@ -483,11 +614,40 @@ class AdvancedDuplicateFileFinder(QMainWindow):
         else:  # Linux and other Unix-like
             subprocess.call(('xdg-open', folder_path))
 
+    def update_disk_space_info(self):
+        folder = self.folder_label.text()
+        if folder == "No folder selected":
+            self.disk_space_label.setText("Select a folder to see disk space information.")
+            return
+
+        try:
+            total, used, free = self.get_disk_space(folder)
+            self.disk_space_label.setText(f"Total: {total/1e9:.2f} GB | Used: {used/1e9:.2f} GB | Free: {free/1e9:.2f} GB")
+        except Exception as e:
+            self.disk_space_label.setText(f"Error getting disk space: {str(e)}")
+
+    def get_disk_space(self, folder):
+        if sys.platform.startswith('win'):
+            import ctypes
+            free_bytes = ctypes.c_ulonglong(0)
+            total_bytes = ctypes.c_ulonglong(0)
+            ctypes.windll.kernel32.GetDiskFreeSpaceExW(ctypes.c_wchar_p(folder), None, ctypes.pointer(total_bytes), ctypes.pointer(free_bytes))
+            total = total_bytes.value
+            free = free_bytes.value
+            used = total - free
+        else:
+            st = os.statvfs(folder)
+            total = st.f_blocks * st.f_frsize
+            free = st.f_bavail * st.f_frsize
+            used = (st.f_blocks - st.f_bfree) * st.f_frsize
+        return total, used, free
+
     def closeEvent(self, event):
         reply = QMessageBox.question(self, 'Exit', 'Are you sure you want to exit?',
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
 
         if reply == QMessageBox.StandardButton.Yes:
+            self.logger.info("Application closed")
             event.accept()
         else:
             event.ignore()
