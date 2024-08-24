@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QTextEdit, QPushButton, QListWidget, QListWidgetItem,
                              QFileIconProvider, QLineEdit, QProgressBar)
 from PyQt6.QtGui import QFont, QIcon, QColor, QPixmap
-from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QSize, QFileInfo, QThread, QObject, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QSize, QFileInfo, QThread, QObject, pyqtSignal, pyqtSlot
 
 class FileHasher(QObject):
     progress = pyqtSignal(int)
@@ -21,7 +21,9 @@ class FileHasher(QObject):
         super().__init__()
         self.folder = folder
         self.file_types = file_types
+        self._isRunning = True
 
+    @pyqtSlot()
     def run(self):
         duplicates = defaultdict(list)
         total_files = sum([len(files) for r, d, files in os.walk(self.folder)])
@@ -30,6 +32,9 @@ class FileHasher(QObject):
         try:
             for root, _, files in os.walk(self.folder):
                 for filename in files:
+                    if not self._isRunning:
+                        break
+
                     try:
                         if self.file_types and not any(filename.lower().endswith(ft.lower()) for ft in self.file_types):
                             continue
@@ -41,9 +46,11 @@ class FileHasher(QObject):
                         self.progress.emit(int(processed_files / total_files * 100))
                     except Exception as e:
                         print(f"Error processing file {filename}: {str(e)}")
+                if not self._isRunning:
+                    break
         except Exception as e:
             print(f"Error during file search: {str(e)}")
-        
+
         self.finished.emit(duplicates)
 
     def hash_file(self, filepath):
@@ -52,9 +59,15 @@ class FileHasher(QObject):
         with open(filepath, "rb") as f:
             fb = f.read(BLOCK_SIZE)
             while len(fb) > 0:
+                if not self._isRunning:
+                    return None
                 file_hash.update(fb)
                 fb = f.read(BLOCK_SIZE)
         return file_hash.hexdigest()
+
+    @pyqtSlot()
+    def stop(self):
+        self._isRunning = False
 
 class AnimatedButton(QPushButton):
     def __init__(self, text, parent=None):
@@ -408,6 +421,7 @@ class AdvancedDuplicateFileFinder(QMainWindow):
 
     def cancel_search(self):
         if hasattr(self, 'thread') and self.thread.isRunning():
+            self.file_hasher.stop()
             self.thread.quit()
             self.thread.wait()
         self.progress_bar.setVisible(False)
